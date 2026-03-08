@@ -1,0 +1,265 @@
+import os
+import base64
+import tempfile
+import subprocess
+import httpx
+import anthropic
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
+import json
+import re
+
+app = FastAPI(title="SYNTHCHECK API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+SYSTEM_PROMPT = """You are SYNTHCHECK, a professional AI content detector. Analyze content and determine if it was AI-generated or human-created.
+
+Respond ONLY with valid JSON (no markdown, no extra text):
+{
+  "verdict": "AI_GENERATED" | "HUMAN" | "SUSPICIOUS",
+  "ai_probability": <number 0-100>,
+  "confidence": "HIGH" | "MEDIUM" | "LOW",
+  "visual_artifacts": "<HIGH|MEDIUM|LOW|N/A>",
+  "pattern_score": "<XX/100>",
+  "consistency": "<INCONSISTENT|NATURAL|MIXED>",
+  "summary": "<2-3 sentence analysis>",
+  "flags": [
+    { "type": "red" | "yellow" | "green", "text": "<finding>" }
+  ]
+}
+
+For images/video frames, look for:
+- Unnatural skin textures, hair, fingers
+- Perfect lighting with no real-world imperfections  
+- Background inconsistencies, warping
+- AI watermark patterns in pixel data
+- Temporal inconsistencies across frames (for video)"""
+
+
+class URLRequest(BaseModel):
+    url: str
+    type: Optional[str] = "auto"  # auto, image, video, text, account
+
+
+class TextRequest(BaseModel):
+    text: str
+    platform: Optional[str] = None
+    account: Optional[str] = None
+
+
+def encode_image(image_bytes: bytes, media_type: str = "image/jpeg") -> dict:
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": media_type,
+            "data": base64.standard_b64encode(image_bytes).decode("utf-8"),
+        },
+    }
+
+
+def analyze_with_claude(messages_content: list, extra_text: str = "") -> dict:
+    messages_content.append({
+        "type": "text",
+        "text": extra_text + "\n\nRespond ONLY with the JSON object."
+    })
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1000,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": messages_content}]
+    )
+    raw = response.content[0].text
+    clean = re.sub(r'```json|```', '', raw).strip()
+    return json.loads(clean)
+
+
+def extract_frames(video_path: str, num_frames: int = 5) -> list[bytes]:
+    """Extract evenly spaced frames from a video using ffmpeg."""
+    frames = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Get video duration
+        probe = subprocess.run([
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_streams", video_path
+        ], capture_output=True, text=True)
+
+        duration = 10.0  # default fallback
+        try:
+            info = json.loads(probe.stdout)
+            for stream in info.get("streams", []):
+                if stream.get("codec_type") == "video":
+                    duration = float(stream.get("duration", 10))
+                    break
+        except Exception:
+            pass
+
+        interval = duration / (num_frames + 1)
+        for i in range(1, num_frames + 1):
+            ts = interval * i
+            out_path = os.path.join(tmpdir, f"frame_{i}.jpg")
+            subprocess.run([
+                "ffmpeg", "-ss", str(ts), "-i", video_path,
+                "-frames:v", "1", "-q:v", "2", out_path, "-y"
+            ], capture_output=True)
+            if os.path.exists(out_path):
+                with open(out_path, "rb") as f:
+                    frames.append(f.read())
+    return frames
+
+
+@app.get("/")
+def root():
+    return {"status": "SYNTHCHECK API running", "version": "2.0"}
+
+
+@app.post("/analyze/text")
+async def analyze_text(req: TextRequest):
+    """Analyze text or social account bio/posts."""
+    if req.account:
+        prompt = f"Analyze this social media account for AI-generated content patterns.\nPlatform: {req.platform or 'unknown'}\nAccount: {req.account}\nSample content/bio: {req.text}"
+    else:
+        prompt = f"Analyze this text for AI generation patterns:\n\n{req.text}"
+    
+    result = analyze_with_claude([{"type": "text", "text": prompt}], "")
+    return result
+
+
+@app.post("/analyze/image")
+async def analyze_image(file: UploadFile = File(...)):
+    """Analyze an uploaded image for AI generation."""
+    img_bytes = await file.read()
+    media_type = file.content_type or "image/jpeg"
+    
+    content = [
+        encode_image(img_bytes, media_type),
+        {"type": "text", "text": "Analyze this image for signs of AI generation. Look carefully at textures, lighting, fingers, hair, backgrounds, and any visual artifacts."}
+    ]
+    result = analyze_with_claude(content, "")
+    return result
+
+
+@app.post("/analyze/url")
+async def analyze_url(req: URLRequest):
+    """Analyze content from a URL - auto-detects image vs video."""
+    url = req.url.strip()
+
+    # Detect type
+    content_type = req.type
+    if content_type == "auto":
+        lower = url.lower()
+        if any(x in lower for x in [".jpg", ".jpeg", ".png", ".webp", ".gif"]):
+            content_type = "image"
+        elif any(x in lower for x in [".mp4", ".mov", ".avi", ".webm", "youtube", "youtu.be", "tiktok", "reel", "video"]):
+            content_type = "video"
+        else:
+            content_type = "webpage"
+
+    if content_type == "image":
+        # Download image and analyze
+        async with httpx.AsyncClient(timeout=30) as http:
+            resp = await http.get(url, follow_redirects=True)
+            if resp.status_code != 200:
+                raise HTTPException(400, "Could not download image")
+            img_bytes = resp.content
+            mt = resp.headers.get("content-type", "image/jpeg").split(";")[0]
+
+        content = [
+            encode_image(img_bytes, mt),
+            {"type": "text", "text": f"Analyze this image from URL: {url}. Look for AI generation artifacts."}
+        ]
+        return analyze_with_claude(content, "")
+
+    elif content_type == "video":
+        # Download video, extract frames, analyze
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            # Try yt-dlp first for social media videos
+            result_dl = subprocess.run([
+                "yt-dlp", "-f", "best[height<=480]",
+                "-o", tmp_path, "--no-playlist", url
+            ], capture_output=True, timeout=60)
+
+            if result_dl.returncode != 0 or not os.path.exists(tmp_path):
+                # Fallback: direct download
+                async with httpx.AsyncClient(timeout=60) as http:
+                    resp = await http.get(url, follow_redirects=True)
+                    with open(tmp_path, "wb") as f:
+                        f.write(resp.content)
+
+            frames = extract_frames(tmp_path, num_frames=5)
+
+            if not frames:
+                raise HTTPException(400, "Could not extract frames from video")
+
+            # Build multi-frame analysis
+            content = []
+            for i, frame_bytes in enumerate(frames[:4]):  # max 4 frames (API limit)
+                content.append(encode_image(frame_bytes, "image/jpeg"))
+            
+            content.append({
+                "type": "text",
+                "text": f"These are {len(frames)} frames extracted from a video at: {url}\n"
+                        "Analyze ALL frames together for AI generation. Check for temporal consistency, "
+                        "unnatural movements, AI face synthesis, background warping across frames."
+            })
+
+            return analyze_with_claude(content, "")
+
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    else:
+        # Webpage / social account URL — analyze contextually
+        content = [{
+            "type": "text",
+            "text": f"Analyze this URL/page for AI-generated content patterns: {url}\n"
+                    "Consider the platform, URL structure, and any detectable signals."
+        }]
+        return analyze_with_claude(content, "")
+
+
+@app.post("/analyze/video")
+async def analyze_video(file: UploadFile = File(...)):
+    """Analyze an uploaded video file for AI generation."""
+    video_bytes = await file.read()
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        tmp.write(video_bytes)
+        tmp_path = tmp.name
+
+    try:
+        frames = extract_frames(tmp_path, num_frames=5)
+
+        if not frames:
+            raise HTTPException(400, "Could not extract frames from video")
+
+        content = []
+        for frame_bytes in frames[:4]:
+            content.append(encode_image(frame_bytes, "image/jpeg"))
+
+        content.append({
+            "type": "text",
+            "text": f"These are frames extracted from an uploaded video file: {file.filename}\n"
+                    "Analyze ALL frames for AI generation. Check temporal consistency, face synthesis, "
+                    "background artifacts, unnatural motion blur, and AI video generation tells."
+        })
+
+        return analyze_with_claude(content, "")
+
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
